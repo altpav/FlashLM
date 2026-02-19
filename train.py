@@ -344,7 +344,7 @@ def train():
     )
 
     print("⚡ Compiling...")
-    compiled = torch.compile(model, mode='reduce-overhead')
+    compiled = model
 
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=C['lr'], betas=C['betas'], weight_decay=C['weight_decay'],
