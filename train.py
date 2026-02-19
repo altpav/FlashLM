@@ -190,20 +190,30 @@ def download_tinystories(data_dir):
 
 def train_tokenizer(train_file, data_dir, vocab_size):
     tok_path = data_dir / "tokenizer.json"
+    
     if tok_path.exists():
         print(f"✅ Tokenizer exists at {tok_path}")
         from tokenizers import Tokenizer
         return Tokenizer.from_file(str(tok_path))
+    
     print(f"🔤 Training BPE-{vocab_size} tokenizer...")
     from tokenizers import ByteLevelBPETokenizer
-    bpe = ByteLevelBPETokenizer()
-    bpe.train(files=[str(train_file)], vocab_size=vocab_size, min_frequency=2,
-              special_tokens=["<pad>", "<unk>", "<bos>", "<eos>"])
-    from tokenizers import Tokenizer as TokClass
-    tok = TokClass(bpe._tokenizer)
-    tok.save(str(tok_path))
+    
+    # Initialize the high-level trainer
+    tokenizer = ByteLevelBPETokenizer()
+    
+    # Train directly on your train_file
+    tokenizer.train(
+        files=[str(train_file)], 
+        vocab_size=vocab_size, 
+        min_frequency=2,
+        special_tokens=["<pad>", "<unk>", "<bos>", "<eos>"]
+    )
+    
+    tokenizer.save(str(tok_path))
     print(f"   ✅ Saved to {tok_path}")
-    return tok
+    
+    return tokenizer
 
 
 def tokenize_to_binary(txt_path, bin_path, tokenizer):
