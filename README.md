@@ -1,3 +1,48 @@
+I came across this interesting idea and wanted to try it and conduct my own experiments and improvements on top of it.
+
+### Notes:
+
+- My idea is to replace `GatedConvMixer` with `GatedDeltaNet`, which maintains a recurrent state matrix S that is updated at each timestep using the gated delta rule: the model computes what it expects to know about the current key (Sk), calculates the delta between the actual value and this expectation (v_t - Sk), then updates the state by decaying the old information (via gating) and adding the precise correction (via the delta rule).
+- The thing with `GatedDeltaNet` (and if im not wrong Kimi Attn) is it enables longer sequences, 1024/2048/etc, and maintains O(N) complexity! But it would be slower due to the sequential loop overhead.
+- I would also like to do some improvements to the current arch created by the OP before experimenting with `GatedDeltaNet` - may be dynamic bs, and based on bitnet b1.58 per block sclaing instead of per layer, high lr for embeddings and lower for deep layers (works for tiny model ?).
+- I've added Blockwise Quantization (now computes per block scaling factors instead of per layer and each block of 256 weights gets its own alpha (mean absolute value), `RMSNorm` is defined before `BitLinear` (will update repo soon w/ results). Pre-norm (old approach) normalizes at block level, but the data may drift before reaching `BitLinear`, so normalizes right before quantization make sure activations are in the correct scale for ternary weight operations (random discord anon).
+
+### Training run before adding blockwise quantisation:
+```
+Parameters: ~5m
+d_model: 192
+Blocks: 6
+GLU hidden dim: 512
+Blocks = 6
+Sequence length: 256
+Vocab size: 10k
+Weight tying
+Total tokens trained: 271.9M
+Best validation loss: 2.304
+
+Eval:
+BPC = 1.2941 | PPL = 53.96
+```
+
+### Sample:
+```
+The little girl was very sad. She tried to go away but the cop said no.
+
+The man took the little girl's hand, so he took her to a safe place. The girl was safe, and she thanked the farmer for warning her. Then she walked away to a big tree.
+
+The duck was so happy to have the lime. The bird and the bird shared the pear a big hug. They both felt proud of themselves for helping the bird. From that da
+```
+
+### Earlier
+
+- Per-layer scaling: Each layer has its own alpha (mean absolute value) for dynamic range.
+- Linear scaling with sequence length instead of quadratic.
+- Gating Mechanism.
+- Up-projects to 2×dim, splits into gate and value.
+- Gate uses sigmoid activation for [0,1] range.
+- Value undergoes causal depthwise convolution.
+- Element-wise multiplication then down-projection.
+-------------------------------------------------------------------
 # FlashLM
 
 A family of ternary (1.58-bit) language models that train and run entirely on CPU. Weights are constrained to {-1, 0, +1}, so inference uses only additions and subtractions — no floating-point multiplies.
