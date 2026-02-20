@@ -10,7 +10,7 @@ I came across this interesting idea (earlier discussed on reddit) and wanted to 
 - Next, my idea is to replace `GatedConvMixer` with `GatedDeltaNet`, which maintains a recurrent state matrix S that is updated at each timestep using the gated delta rule: the model computes what it expects to know about the current key (Sk), calculates the delta between the actual value and this expectation (v_t - Sk), then updates the state by decaying the old information (via gating) and adding the precise correction (via the delta rule).
 - The thing with `GatedDeltaNet` (and if im not wrong Kimi Attn) is it enables longer sequences, 1024/2048/etc, and maintains O(N) complexity! But it would be slower due to the sequential loop overhead.
 - Added `GatedDeltaNet` - it's naive, but combining GatedDeltaNet with ternary quantization is interesting. The implementation doesn't parallelize across sequence length, whereas in nvlabs repo we can see they've used chunkwise parallel algo. For output norm nvlabs uses FusedRMSNormSwishGate, and mine applies output gate via g_proj but no norm.
-- Im not working with large seq len so i can skip Flash attn style chunking. I just need to see how i can implement parallel computation within chunk - we need to compute delta updates in parallel. lol <think> time to use opencode. </think>
+- Im not working with large seq len so i can skip Flash attn style chunking.  ~~I just need to see how i can implement parallel computation within chunk - we need to compute delta updates in parallel. lol <think> time to use opencode. </think>~~. Anyway, I won't test things for seq len > 1024 so I can skip parallel chunking for now.
 
 
 ### Training run before adding blockwise quantisation:
