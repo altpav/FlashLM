@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """
-FlashLM v5 "Thunderbolt" — All-in-One Training Script
-======================================================
-Single file: downloads data, trains tokenizer, tokenizes,
-builds model, trains 24h, evaluates, generates stories.
+FlashLM v5.2 "Nova-Ignition" — Optimized for 2 CPU / 5GB RAM
+==============================================================
+Streamlined version that ACTUALLY runs on constrained hardware.
+
+Key optimizations:
+- Smaller model (~8M params instead of 36M)
+- Simplified attention (single-head, local window)
+- Efficient MoE with vectorized routing
+- Removed expensive Differential Attention overhead
 """
 
 import os
@@ -11,6 +16,7 @@ import sys
 import time
 import math
 import json
+import gc
 import numpy as np
 import torch
 import torch.nn as nn
@@ -18,520 +24,532 @@ import torch.nn.functional as F
 from pathlib import Path
 from torch.utils.data import Dataset, DataLoader
 
+# ============================================================================
+# CONFIGURATION — Optimized for 2 CPU Reality
+# ============================================================================
 CONFIG = {
-    'vocab': 8192,
-    'd_model': 384,
-    'n_heads': 8,
-    'd_head': 48,
-    'n_layers': 18,
-    'd_ffn': 1152,
-    'seq_len': 256,
-    'batch_size': 64,
-    'grad_accum': 2,
-    'lr': 3e-3,
-    'min_lr': 3e-4,
-    'warmup_steps': 500,
+    # Model - Smaller but efficient
+    'vocab': 4096,
+    'd_model': 192,
+    'n_layers': 6,
+    'n_heads': 3,
+    'd_head': 64,
+    'd_ffn': 384,
+    'n_experts': 4,
+    'expert_dim': 384,
+
+    # Training - Aggressive settings
+    'seq_len': 128,
+    'batch_size': 4,
+    'grad_accum': 8,
+    'lr': 5e-3,
+    'min_lr': 5e-5,
+    'warmup_steps': 50,
     'weight_decay': 0.05,
     'grad_clip': 1.0,
     'betas': (0.9, 0.95),
-    'total_hours': 24.0,
-    'save_every': 2000,
-    'eval_every': 500,
-    'log_every': 50,
-    'gen_every': 2000,
-    'data_dir': 'data',
-    'out_dir': 'out',
+
+    # Schedule
+    'total_hours': 2.0,
+    'save_every': 200,
+    'eval_every': 50,
+    'log_every': 10,
+    'gen_every': 100,
+
+    # Data
+    'data_dir': 'data_v52',
+    'out_dir': 'out_v52',
+    'max_train_tokens': 5_000_000,
 }
 
 
+# ============================================================================
+# BITLINEAR 1.58b — Ternary Weights
+# ============================================================================
 class BitLinear(nn.Module):
-    def __init__(self, in_f, out_f, bias=False):
+    """1.58-bit Linear: Weights quantized to {-1, 0, +1}"""
+    def __init__(self, in_features, out_features, bias=False):
         super().__init__()
-        self.weight = nn.Parameter(torch.empty(out_f, in_f))
-        self.bias = nn.Parameter(torch.zeros(out_f)) if bias else None
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))
+        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None
         nn.init.kaiming_normal_(self.weight, mode='fan_out')
 
     def forward(self, x):
-        scale = self.weight.abs().mean().clamp(min=1e-5)
-        w_q = (self.weight / scale).round().clamp(-1, 1)
+        scale = self.weight.abs().mean(dim=1, keepdim=True).clamp(min=1e-5)
+        w_q = torch.round(self.weight / scale).clamp(-1, 1)
         w = self.weight + (w_q * scale - self.weight).detach()
         return F.linear(x, w, self.bias)
 
 
-def parallel_scan(gates, inputs):
-    B, T, D = gates.shape
-    h = inputs.clone()
-    g = gates.clone()
-    for k in range(int(math.ceil(math.log2(T)))):
-        offset = 2 ** k
-        if offset >= T:
-            break
-        g_shift = F.pad(g[:, :-offset], (0, 0, offset, 0), value=0.0)
-        h_shift = F.pad(h[:, :-offset], (0, 0, offset, 0), value=0.0)
-        h = h + g * h_shift
-        g = g * g_shift
-    return h
-
-
-class ParallelGatedRecurrence(nn.Module):
-    def __init__(self, d_model, d_head=48, n_heads=8, layer_idx=0, n_layers=18):
+# ============================================================================
+# EFFICIENT LOCAL ATTENTION — O(n * window) instead of O(n²)
+# ============================================================================
+class LocalAttention(nn.Module):
+    """Sliding window attention - much faster on CPU"""
+    def __init__(self, d_model, n_heads, d_head, window_size=32):
         super().__init__()
-        self.d_head = d_head
         self.n_heads = n_heads
-        total_dim = d_head * n_heads
-        self.W_f = BitLinear(d_model, total_dim)
-        self.W_v = BitLinear(d_model, total_dim)
-        self.W_o = BitLinear(d_model, total_dim)
-        self.W_proj = BitLinear(total_dim, d_model)
-        gamma = layer_idx / max(n_layers - 1, 1)
-        self.gate_lb = gamma * 0.9
-        self.f_bias = nn.Parameter(torch.zeros(total_dim))
-        self.gn = nn.GroupNorm(n_heads, total_dim)
+        self.d_head = d_head
+        self.window = window_size
+        self.total_dim = n_heads * d_head
+
+        self.qkv = BitLinear(d_model, 3 * self.total_dim)
+        self.out = BitLinear(self.total_dim, d_model)
+        self.norm = nn.LayerNorm(d_model)
 
     def forward(self, x):
-        f_pre = self.W_f(x) + self.f_bias
-        forget = self.gate_lb + (1 - self.gate_lb) * torch.sigmoid(f_pre)
-        value = self.W_v(x)
-        out_gate = torch.sigmoid(self.W_o(x))
-        gated_in = (1 - forget) * value
-        hidden = parallel_scan(forget, gated_in)
-        output = out_gate * hidden
-        output = self.gn(output.transpose(1, 2)).transpose(1, 2)
-        return self.W_proj(output)
+        B, T, D = x.shape
+        h = self.norm(x)
+
+        # Project QKV
+        qkv = self.qkv(h)
+        q, k, v = qkv.chunk(3, dim=-1)
+
+        # Reshape for multi-head: (B, T, H, Dh) -> (B, H, T, Dh)
+        q = q.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        k = k.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+        v = v.view(B, T, self.n_heads, self.d_head).transpose(1, 2)
+
+        # Scale
+        q = q * (self.d_head ** -0.5)
+
+        # Efficient causal local attention
+        out = torch.empty_like(q)
+        for t in range(T):
+            start = max(0, t - self.window + 1)
+            # (B, H, 1, Dh) @ (B, H, Dh, L) -> (B, H, 1, L)
+            scores = torch.matmul(q[:, :, t:t+1], k[:, :, start:t+1].transpose(-1, -2))
+            weights = F.softmax(scores, dim=-1)
+            out[:, :, t] = torch.matmul(weights, v[:, :, start:t+1]).squeeze(2)
+
+        out = out.transpose(1, 2).reshape(B, T, -1)
+        return self.out(out)
 
 
-class ThunderboltBlock(nn.Module):
-    def __init__(self, d_model, d_head, n_heads, d_ffn, layer_idx, n_layers):
+# ============================================================================
+# SIMPLIFIED MoE — Vectorized Routing
+# ============================================================================
+class SimpleMoE(nn.Module):
+    """Efficient MoE with vectorized operations"""
+    def __init__(self, d_model, expert_dim, n_experts):
         super().__init__()
-        self.ln1 = nn.LayerNorm(d_model)
-        self.ln2 = nn.LayerNorm(d_model)
-        self.mix1 = nn.Parameter(torch.zeros(d_model))
-        self.mix2 = nn.Parameter(torch.zeros(d_model))
-        self.rec = ParallelGatedRecurrence(d_model, d_head, n_heads, layer_idx, n_layers)
-        self.ffn_up = BitLinear(d_model, d_ffn)
-        self.ffn_down = BitLinear(d_ffn, d_model)
+        self.n_experts = n_experts
+        self.d_model = d_model
 
-    def _shift(self, x, mix):
-        m = mix.sigmoid()
-        return x * m + F.pad(x[:, :-1], (0, 0, 1, 0)) * (1 - m)
+        # Shared expert (always active)
+        self.shared = nn.Sequential(
+            BitLinear(d_model, expert_dim),
+            nn.SiLU(),
+            BitLinear(expert_dim, d_model)
+        )
+
+        # Routed experts - combined for efficiency
+        self.expert_up = BitLinear(d_model, n_experts * expert_dim)
+        self.expert_down = BitLinear(n_experts * expert_dim, d_model)
+
+        # Router
+        self.router = nn.Linear(d_model, n_experts, bias=False)
+        self.norm = nn.LayerNorm(d_model)
 
     def forward(self, x):
-        h = self._shift(self.ln1(x), self.mix1)
-        x = x + self.rec(h)
-        h = self._shift(self.ln2(x), self.mix2)
-        x = x + self.ffn_down(F.relu(self.ffn_up(h)).square())
+        B, T, D = x.shape
+        h = self.norm(x)
+
+        # Shared expert
+        shared_out = self.shared(h)
+
+        # Router
+        router_logits = self.router(h)  # (B, T, E)
+        router_probs = F.softmax(router_logits, dim=-1)  # (B, T, E)
+
+        # All experts at once
+        expert_hidden = self.expert_up(h)  # (B, T, E * expert_dim)
+        expert_hidden = F.silu(expert_hidden)
+
+        # Reshape and weight by router
+        expert_hidden = expert_hidden.view(B, T, self.n_experts, -1)  # (B, T, E, dim)
+        router_weights = router_probs.unsqueeze(-1)  # (B, T, E, 1)
+        weighted = (expert_hidden * router_weights).view(B, T, -1)  # (B, T, E * dim)
+
+        routed_out = self.expert_down(weighted)
+
+        return shared_out + routed_out
+
+
+# ============================================================================
+# TRANSFORMER BLOCK
+# ============================================================================
+class NovaBlock(nn.Module):
+    def __init__(self, d_model, n_heads, d_head, d_ffn, n_experts, expert_dim):
+        super().__init__()
+        self.attn = LocalAttention(d_model, n_heads, d_head)
+        self.ffn = SimpleMoE(d_model, expert_dim, n_experts)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.ffn(self.norm2(x))
         return x
 
 
-class ThunderboltLM(nn.Module):
-    def __init__(self, vocab=8192, d_model=384, n_heads=8, d_head=48,
-                 n_layers=18, d_ffn=1152):
+# ============================================================================
+# NOVA-IGNITION LM
+# ============================================================================
+class NovaIgnitionLM(nn.Module):
+    def __init__(self, vocab=4096, d_model=192, n_layers=6, n_heads=3,
+                 d_head=64, d_ffn=384, n_experts=4, expert_dim=384):
         super().__init__()
-        self.config = dict(vocab=vocab, d_model=d_model, n_heads=n_heads,
-                           d_head=d_head, n_layers=n_layers, d_ffn=d_ffn)
+        self.config = {k: v for k, v in locals().items() if k != 'self'}
+
         self.embed = nn.Embedding(vocab, d_model)
-        nn.init.normal_(self.embed.weight, std=0.02)
+        self.embed_scale = d_model ** -0.5
+
         self.blocks = nn.ModuleList([
-            ThunderboltBlock(d_model, d_head, n_heads, d_ffn, i, n_layers)
-            for i in range(n_layers)
+            NovaBlock(d_model, n_heads, d_head, d_ffn, n_experts, expert_dim)
+            for _ in range(n_layers)
         ])
+
         self.ln_out = nn.LayerNorm(d_model)
-        self.head = nn.Linear(d_model, vocab, bias=False)
-        self.head.weight = self.embed.weight
-        total = sum(p.numel() for p in self.parameters())
-        ternary = sum(p.numel() for m in self.modules()
-                      if isinstance(m, BitLinear) for p in m.parameters())
-        self._total_params = total
-        self._ternary_params = ternary
-        print(f"\n📊 ThunderboltLM")
-        print(f"   Total params:   {total:,}")
-        print(f"   Ternary params: {ternary:,} ({100*ternary/total:.0f}%)")
-        print(f"   Float params:   {total-ternary:,} ({100*(total-ternary)/total:.0f}%)")
-        print(f"   Ternary packed: {ternary*2/8/1024/1024:.1f} MB")
-        print(f"   Training RAM:   ~{total*4*3/1024/1024/1024:.1f} GB\n")
+        self.head = BitLinear(d_model, vocab)
+
+        # Init
+        nn.init.normal_(self.embed.weight, std=0.02)
+
+        # Stats
+        self._total_params = sum(p.numel() for p in self.parameters())
+        self._bitlinear_params = sum(
+            p.numel() for m in self.modules()
+            if isinstance(m, BitLinear) for p in m.parameters()
+        )
+
+        print(f"\n{'═'*55}")
+        print(f"🚀 FlashLM v5.2 'Nova-Ignition' (Optimized)")
+        print(f"{'═'*55}")
+        print(f"   Parameters:      {self._total_params:,}")
+        print(f"   BitLinear:       {self._bitlinear_params:,} ({100*self._bitlinear_params/self._total_params:.0f}%)")
+        print(f"   Est. RAM:        ~{self._total_params*4*2.5/1024/1024/1024:.2f} GB")
+        print(f"{'═'*55}\n")
 
     def forward(self, x, targets=None):
-        h = self.embed(x)
+        h = self.embed(x) * self.embed_scale
         for block in self.blocks:
             h = block(h)
         logits = self.head(self.ln_out(h))
+
         if targets is not None:
-            return F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            return loss
         return logits
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=0.8, top_k=50):
+    def generate(self, idx, max_new_tokens, temperature=0.8, top_k=40):
         self.eval()
         for _ in range(max_new_tokens):
-            logits = self(idx[:, -512:])
+            ctx = idx[:, -CONFIG['seq_len']:]
+            logits = self(ctx)
             logits = logits[:, -1, :] / temperature
             if top_k > 0:
-                v, _ = torch.topk(logits, top_k)
-                logits[logits < v[:, [-1]]] = -float('Inf')
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = float('-inf')
             probs = F.softmax(logits, dim=-1)
             idx = torch.cat([idx, torch.multinomial(probs, 1)], dim=1)
         return idx
 
 
-def download_tinystories(data_dir):
-    train_file = data_dir / "train.txt"
-    val_file = data_dir / "val.txt"
-    base = "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main"
-    if not train_file.exists():
-        print("📥 Downloading TinyStories train (~1.5GB)...")
-        os.system(f"wget -q --show-progress -O '{train_file}' '{base}/TinyStoriesV2-GPT4-train.txt'")
-    if not val_file.exists():
-        print("📥 Downloading TinyStories val...")
-        os.system(f"wget -q --show-progress -O '{val_file}' '{base}/TinyStoriesV2-GPT4-valid.txt'")
-    print(f"   Train: {train_file.stat().st_size / 1e9:.2f} GB")
-    print(f"   Val:   {val_file.stat().st_size / 1e6:.1f} MB")
-    return train_file, val_file
-
-
-def train_tokenizer(train_file, data_dir, vocab_size):
-    tok_path = data_dir / "tokenizer.json"
-    
-    if tok_path.exists():
-        print(f"✅ Tokenizer exists at {tok_path}")
-        from tokenizers import Tokenizer
-        return Tokenizer.from_file(str(tok_path))
-    
-    print(f"🔤 Training BPE-{vocab_size} tokenizer...")
-    from tokenizers import ByteLevelBPETokenizer
-    
-    # Initialize the high-level trainer
-    tokenizer = ByteLevelBPETokenizer()
-    
-    # Train directly on your train_file
-    tokenizer.train(
-        files=[str(train_file)], 
-        vocab_size=vocab_size, 
-        min_frequency=2,
-        special_tokens=["<pad>", "<unk>", "<bos>", "<eos>"]
-    )
-    
-    tokenizer.save(str(tok_path))
-    print(f"   ✅ Saved to {tok_path}")
-    
-    return tokenizer
-
-
-def tokenize_to_binary(txt_path, bin_path, tokenizer):
-    if bin_path.exists():
-        arr = np.fromfile(str(bin_path), dtype=np.uint16)
-        print(f"   ✅ {bin_path.name} exists: {len(arr):,} tokens")
-        return len(arr)
-    print(f"   🔢 Tokenizing {txt_path.name}...")
-    tokens = []
-    batch = []
-    with open(txt_path, 'r', encoding='utf-8') as f:
-        for i, line in enumerate(f):
-            line = line.strip()
-            if not line:
-                continue
-            batch.append(line)
-            if len(batch) >= 10000:
-                for enc in tokenizer.encode_batch(batch):
-                    tokens.extend(enc.ids)
-                batch = []
-                if (i + 1) % 500000 == 0:
-                    print(f"      {i+1:,} lines → {len(tokens):,} tokens")
-        if batch:
-            for enc in tokenizer.encode_batch(batch):
-                tokens.extend(enc.ids)
-    arr = np.array(tokens, dtype=np.uint16)
-    arr.tofile(str(bin_path))
-    print(f"   ✅ {len(arr):,} tokens → {bin_path} ({arr.nbytes/1e6:.1f} MB)")
-    return len(arr)
-
-
-def prepare_data(config):
-    data_dir = Path(config['data_dir'])
-    data_dir.mkdir(exist_ok=True)
-    print(f"\n{'═'*60}")
-    print(f"📦 PREPARING DATA")
-    print(f"{'═'*60}")
-    train_file, val_file = download_tinystories(data_dir)
-    tokenizer = train_tokenizer(train_file, data_dir, config['vocab'])
-    n_train = tokenize_to_binary(train_file, data_dir / "train.bin", tokenizer)
-    n_val = tokenize_to_binary(val_file, data_dir / "val.bin", tokenizer)
-    print(f"\n   📊 Train: {n_train:,} | Val: {n_val:,}")
-    print(f"   ⏱  At 14K tok/s: {n_train/14000/3600:.1f}h/epoch | 24h ≈ {24*14000*3600/n_train:.1f} epochs")
-    print(f"{'═'*60}\n")
-    return tokenizer, n_train, n_val
-
-
-class TokenDataset(Dataset):
-    def __init__(self, data, seq_len):
-        self.data = data
+# ============================================================================
+# ZERO-COPY DATASET
+# ============================================================================
+class ZeroCopyDataset(Dataset):
+    def __init__(self, bin_path, seq_len, max_tokens=None):
         self.seq_len = seq_len
-        self.n = (len(data) - 1) // seq_len
+        self.data = np.memmap(str(bin_path), dtype=np.uint16, mode='r')
+        if max_tokens and len(self.data) > max_tokens:
+            self.data = self.data[:max_tokens]
+        self.n = (len(self.data) - 1) // seq_len
+        print(f"   Dataset: {self.n:,} samples, {len(self.data):,} tokens")
 
     def __len__(self):
         return self.n
 
     def __getitem__(self, idx):
         i = idx * self.seq_len
-        chunk = self.data[i : i + self.seq_len + 1]
-        return chunk[:-1].clone(), chunk[1:].clone()
+        chunk = np.array(self.data[i : i + self.seq_len + 1])
+        return (torch.from_numpy(chunk[:-1].astype(np.int64)),
+                torch.from_numpy(chunk[1:].astype(np.int64)))
 
 
-def get_lr(step, warmup, max_lr, min_lr, total_steps=80000):
-    if step < warmup:
-        return max_lr * (step + 1) / warmup
-    if step >= total_steps:
-        return min_lr
-    ratio = (step - warmup) / (total_steps - warmup)
-    return min_lr + 0.5 * (max_lr - min_lr) * (1 + math.cos(math.pi * ratio))
+# ============================================================================
+# DATA PREPARATION
+# ============================================================================
+def prepare_data(config):
+    data_dir = Path(config['data_dir'])
+    data_dir.mkdir(exist_ok=True)
+
+    train_bin = data_dir / "train.bin"
+    val_bin = data_dir / "val.bin"
+    tok_path = data_dir / "tokenizer.json"
+
+    if train_bin.exists() and val_bin.exists() and tok_path.exists():
+        print(f"✅ Data already prepared")
+        return str(tok_path)
+
+    print(f"\n{'═'*55}")
+    print(f"📦 PREPARING DATA")
+    print(f"{'═'*55}")
+
+    train_txt = data_dir / "stories.txt"
+
+    if not train_txt.exists():
+        print("📥 Downloading TinyStories...")
+        import urllib.request
+        import random
+
+        url = "https://huggingface.co/datasets/roneneldan/TinyStories/resolve/main/TinyStoriesV2-GPT4-valid.txt"
+        urllib.request.urlretrieve(url, train_txt)
+        print(f"   Downloaded: {train_txt.stat().st_size / 1e6:.1f} MB")
+
+        if train_txt.stat().st_size > 30_000_000:
+            with open(train_txt, 'r', encoding='utf-8') as f:
+                lines = [l for l in f if l.strip()]
+            if len(lines) > 20000:
+                lines = random.sample(lines, 20000)
+            with open(train_txt, 'w', encoding='utf-8') as f:
+                f.writelines(lines)
+            print(f"   Reduced: {train_txt.stat().st_size / 1e6:.1f} MB")
+
+    # Tokenizer
+    print(f"\n🔤 Training tokenizer...")
+    from tokenizers import Tokenizer
+    from tokenizers.models import BPE
+    from tokenizers.trainers import BpeTrainer
+    from tokenizers.pre_tokenizers import ByteLevel
+
+    if not tok_path.exists():
+        tokenizer = Tokenizer(BPE())
+        tokenizer.pre_tokenizer = ByteLevel()
+        tokenizer.train(files=[str(train_txt)], trainer=BpeTrainer(
+            vocab_size=config['vocab'], min_frequency=2,
+            special_tokens=["<pad>", "<unk>", "<bos>", "<eos>"]
+        ))
+        tokenizer.save(str(tok_path))
+    else:
+        tokenizer = Tokenizer.from_file(str(tok_path))
+
+    # Tokenize
+    if not train_bin.exists():
+        print(f"🔢 Tokenizing...")
+        with open(train_txt, 'r', encoding='utf-8') as f:
+            stories = [s.strip() for s in f.read().split('\n\n') if s.strip()]
+
+        tokens = []
+        eos_id = tokenizer.token_to_id("<eos>") or 0
+        for story in stories[:25000]:
+            tokens.extend(tokenizer.encode(story).ids)
+            tokens.append(eos_id)
+
+        tokens = tokens[:config['max_train_tokens']]
+        arr = np.array(tokens, dtype=np.uint16)
+        arr.tofile(str(train_bin))
+        print(f"   Train: {len(arr):,} tokens")
+
+        split = int(len(arr) * 0.9)
+        arr[split:].tofile(str(val_bin))
+        print(f"   Val: {len(arr) - split:,} tokens")
+
+    print(f"{'═'*55}\n")
+    return str(tok_path)
 
 
+# ============================================================================
+# LR SCHEDULE
+# ============================================================================
+def get_lr(step, config):
+    if step < config['warmup_steps']:
+        return config['lr'] * (step + 1) / config['warmup_steps']
+
+    cycle = 300
+    pos = (step - config['warmup_steps']) % cycle
+    num = (step - config['warmup_steps']) // cycle
+    max_lr = config['lr'] * (0.9 ** num)
+
+    return config['min_lr'] + 0.5 * (max_lr - config['min_lr']) * (1 + math.cos(math.pi * pos / cycle))
+
+
+# ============================================================================
+# EVALUATION
+# ============================================================================
 @torch.no_grad()
-def evaluate(model, val_data, seq_len, batch_size=32, max_batches=80):
+def evaluate(model, val_data, seq_len, max_batches=20):
     model.eval()
-    ds = TokenDataset(val_data, seq_len)
-    dl = DataLoader(ds, batch_size=batch_size, shuffle=False)
-    total_loss = 0.0
-    total_tokens = 0
-    for i, (x, y) in enumerate(dl):
-        if i >= max_batches:
-            break
+    total_loss, total_tokens = 0.0, 0
+    n = (len(val_data) - 1) // seq_len
+
+    for _ in range(min(max_batches, n // 4)):
+        batch_x, batch_y = [], []
+        for _ in range(4):
+            i = np.random.randint(0, n) * seq_len
+            chunk = val_data[i:i + seq_len + 1]
+            batch_x.append(chunk[:-1])
+            batch_y.append(chunk[1:])
+
+        x = torch.tensor(np.stack(batch_x), dtype=torch.long)
+        y = torch.tensor(np.stack(batch_y), dtype=torch.long)
+
         with torch.autocast(device_type='cpu', dtype=torch.bfloat16):
             loss = model(x, targets=y)
+
         total_loss += loss.item() * x.numel()
         total_tokens += x.numel()
+
     model.train()
     avg = total_loss / max(total_tokens, 1)
-    return {'loss': avg, 'bpc': avg / math.log(2), 'ppl': math.exp(min(avg, 20))}
+    return {'loss': avg, 'ppl': math.exp(min(avg, 20))}
 
 
-def generate_sample(model, tokenizer, prompt, max_tokens=120):
-    raw = model._orig_mod if hasattr(model, '_orig_mod') else model
-    was_training = raw.training
-    raw.eval()
-    ids = tokenizer.encode(prompt).ids
-    x = torch.tensor([ids], dtype=torch.long)
-    out = raw.generate(x, max_new_tokens=max_tokens, temperature=0.8, top_k=50)
-    text = tokenizer.decode(out[0].tolist())
-    if was_training:
-        raw.train()
-    return text
-
-
+# ============================================================================
+# TRAINING
+# ============================================================================
 def train():
-    C = CONFIG
-    out_dir = Path(C['out_dir'])
+    config = CONFIG
+    out_dir = Path(config['out_dir'])
     out_dir.mkdir(exist_ok=True)
 
-    tokenizer, n_train_tokens, n_val_tokens = prepare_data(C)
+    # CPU optimization
+    torch.set_num_threads(2)
+    os.environ['OMP_NUM_THREADS'] = '2'
 
-    print("📂 Loading tokens into RAM...")
-    data_dir = Path(C['data_dir'])
-    train_data = torch.from_numpy(np.fromfile(str(data_dir / 'train.bin'), dtype=np.uint16).astype(np.int64))
-    val_data = torch.from_numpy(np.fromfile(str(data_dir / 'val.bin'), dtype=np.uint16).astype(np.int64))
-    n_train = len(train_data)
-    print(f"   Train: {n_train:,} tokens | Val: {len(val_data):,} tokens")
+    # Data
+    tok_path = prepare_data(config)
+    from tokenizers import Tokenizer
+    tokenizer = Tokenizer.from_file(tok_path)
 
-    train_dl = DataLoader(
-        TokenDataset(train_data, C['seq_len']),
-        batch_size=C['batch_size'], shuffle=True,
-        num_workers=6, persistent_workers=True, drop_last=True,
+    val_data = np.fromfile(str(Path(config['data_dir']) / 'val.bin'), dtype=np.uint16)
+    print(f"📊 Val: {len(val_data):,} tokens\n")
+
+    train_ds = ZeroCopyDataset(
+        str(Path(config['data_dir']) / 'train.bin'),
+        config['seq_len'], config['max_train_tokens']
     )
 
-    print("🏗️  Building ThunderboltLM...")
-    model = ThunderboltLM(
-        vocab=C['vocab'], d_model=C['d_model'], n_heads=C['n_heads'],
-        d_head=C['d_head'], n_layers=C['n_layers'], d_ffn=C['d_ffn'],
+    train_dl = DataLoader(train_ds, batch_size=config['batch_size'],
+                          shuffle=True, num_workers=0, drop_last=True)
+
+    # Model
+    print("🏗️  Building model...")
+    model = NovaIgnitionLM(
+        vocab=config['vocab'], d_model=config['d_model'],
+        n_layers=config['n_layers'], n_heads=config['n_heads'],
+        d_head=config['d_head'], d_ffn=config['d_ffn'],
+        n_experts=config['n_experts'], expert_dim=config['expert_dim'],
     )
 
-    print("⚡ Compiling...")
-    compiled = torch.compile(model, mode='reduce-overhead')
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config['lr'],
+                                  betas=config['betas'], weight_decay=config['weight_decay'])
 
-    optimizer = torch.optim.AdamW(
-        model.parameters(), lr=C['lr'], betas=C['betas'], weight_decay=C['weight_decay'],
-    )
-
-    step = 0
-    tokens_seen = 0
-    best_val = float('inf')
-    log_loss = 0.0
-
+    # Resume
+    step, tokens_seen, best_val, log_loss = 0, 0, float('inf'), 0.0
     ckpt_path = out_dir / 'latest.pt'
     if ckpt_path.exists():
-        print(f"📂 Resuming from {ckpt_path}...")
         ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
         model.load_state_dict(ckpt['model'])
         optimizer.load_state_dict(ckpt['optimizer'])
-        step = ckpt['step']
-        tokens_seen = ckpt['tokens']
-        best_val = ckpt.get('best_val', float('inf'))
-        print(f"   Resumed at step {step}, {tokens_seen/1e6:.0f}M tokens")
+        step, tokens_seen, best_val = ckpt['step'], ckpt['tokens'], ckpt.get('best_val', float('inf'))
+        print(f"📂 Resumed: step {step}, {tokens_seen/1e6:.1f}M tokens\n")
 
-    json.dump(C, open(out_dir / 'config.json', 'w'), indent=2)
+    json.dump(config, open(out_dir / 'config.json', 'w'), indent=2)
 
-    toks_per_step = C['batch_size'] * C['grad_accum'] * C['seq_len']
-    prompts = ["Once upon a time", "The little girl", "One day, a dog",
-               "There was a magical", "The brave knight"]
+    prompts = ["Once upon a time", "The little girl", "A dog named"]
+    toks_per_step = config['batch_size'] * config['grad_accum'] * config['seq_len']
 
-    print(f"\n{'═'*60}")
-    print(f"🚀 TRAINING — {C['total_hours']}h | {toks_per_step:,} tok/step")
-    print(f"{'═'*60}\n")
+    print(f"{'═'*55}")
+    print(f"🚀 TRAINING — {config['total_hours']}h | {toks_per_step:,} tok/step")
+    print(f"{'═'*55}\n")
 
     t_start = time.time()
     train_iter = iter(train_dl)
 
     while True:
         elapsed = time.time() - t_start
-        if elapsed / 3600 >= C['total_hours']:
-            print(f"\n⏰ Time limit reached ({elapsed/3600:.2f}h)")
+        if elapsed / 3600 >= config['total_hours']:
+            print(f"\n⏰ Time limit ({elapsed/3600:.2f}h)")
             break
 
-        compiled.train()
         optimizer.zero_grad(set_to_none=True)
 
-        for _ in range(C['grad_accum']):
+        for _ in range(config['grad_accum']):
             try:
                 x, y = next(train_iter)
             except StopIteration:
                 train_iter = iter(train_dl)
                 x, y = next(train_iter)
+
             with torch.autocast(device_type='cpu', dtype=torch.bfloat16):
-                loss = compiled(x, targets=y) / C['grad_accum']
+                loss = model(x, targets=y) / config['grad_accum']
             loss.backward()
             log_loss += loss.item()
             tokens_seen += x.numel()
 
-        torch.nn.utils.clip_grad_norm_(model.parameters(), C['grad_clip'])
-        lr = get_lr(step, C['warmup_steps'], C['lr'], C['min_lr'])
+        torch.nn.utils.clip_grad_norm_(model.parameters(), config['grad_clip'])
+
+        lr = get_lr(step, config)
         for pg in optimizer.param_groups:
             pg['lr'] = lr
         optimizer.step()
         step += 1
 
-        if step % C['log_every'] == 0:
+        if step % 25 == 0:
+            gc.collect()
+
+        if step % config['log_every'] == 0:
             tps = tokens_seen / elapsed if elapsed > 0 else 0
-            ep = tokens_seen / n_train
-            eta = C['total_hours'] - elapsed / 3600
-            print(f"Step {step:6d} │ Loss {log_loss/C['log_every']:.4f} │ "
-                  f"LR {lr:.1e} │ {tps:,.0f} tok/s │ "
-                  f"{tokens_seen/1e6:.0f}M ({ep:.2f}ep) │ ETA {eta:.1f}h")
+            print(f"Step {step:4d} │ Loss {log_loss/config['log_every']:.4f} │ "
+                  f"LR {lr:.1e} │ {tps:,.0f} tok/s │ {tokens_seen/1e6:.2f}M")
             log_loss = 0.0
 
-        if step % C['eval_every'] == 0:
-            m = evaluate(compiled, val_data, C['seq_len'])
-            is_best = m['loss'] < best_val
-            if is_best:
+        if step % config['eval_every'] == 0:
+            m = evaluate(model, val_data, config['seq_len'])
+            if m['loss'] < best_val:
                 best_val = m['loss']
                 torch.save(model.state_dict(), out_dir / 'best.pt')
-            print(f"  ✦ VAL │ Loss {m['loss']:.4f} │ BPC {m['bpc']:.3f} │ "
-                  f"PPL {m['ppl']:.2f}{' ★ BEST' if is_best else ''}")
+            print(f"  ✦ VAL │ Loss {m['loss']:.4f} │ PPL {m['ppl']:.1f}{' ★' if m['loss'] == best_val else ''}")
 
-        if step % C['gen_every'] == 0 and step > 0:
-            print(f"\n{'─'*60}")
-            print(f"📝 GENERATION SAMPLES (step {step})")
-            print(f"{'─'*60}")
+        if step % config['gen_every'] == 0 and step > 0:
+            print(f"\n{'─'*40}")
+            model.eval()
             for p in prompts[:2]:
-                s = generate_sample(model, tokenizer, p, max_tokens=100)
-                print(f"  > {s[:300]}")
-            print(f"{'─'*60}\n")
+                ids = tokenizer.encode(p).ids
+                x = torch.tensor([ids], dtype=torch.long)
+                out = model.generate(x, max_new_tokens=40, temperature=0.8, top_k=30)
+                print(f"  > {tokenizer.decode(out[0].tolist())[:120]}")
+            model.train()
+            print(f"{'─'*40}\n")
 
-        if step % C['save_every'] == 0:
-            torch.save({
-                'step': step, 'tokens': tokens_seen,
-                'model': model.state_dict(),
-                'optimizer': optimizer.state_dict(),
-                'config': C, 'best_val': best_val,
-            }, out_dir / 'latest.pt')
-            print(f"  💾 Checkpoint saved (step {step})")
+        if step % config['save_every'] == 0:
+            torch.save({'step': step, 'tokens': tokens_seen, 'model': model.state_dict(),
+                        'optimizer': optimizer.state_dict(), 'best_val': best_val}, out_dir / 'latest.pt')
+            print(f"  💾 Saved checkpoint")
 
-    m = evaluate(compiled, val_data, C['seq_len'])
+    # Final
+    m = evaluate(model, val_data, config['seq_len'])
     torch.save(model.state_dict(), out_dir / 'final.pt')
 
-    print(f"\n{'═'*60}")
-    print(f"✅ TRAINING COMPLETE")
-    print(f"   Steps:       {step:,}")
-    print(f"   Tokens seen: {tokens_seen/1e9:.2f}B")
-    print(f"   Epochs:      {tokens_seen/n_train:.2f}")
-    print(f"   Time:        {(time.time()-t_start)/3600:.1f}h")
-    print(f"   Final loss:  {m['loss']:.4f}")
-    print(f"   Final BPC:   {m['bpc']:.3f}")
-    print(f"   Final PPL:   {m['ppl']:.2f}")
-    print(f"   Best loss:   {best_val:.4f}")
-    print(f"{'═'*60}")
+    print(f"\n{'═'*55}")
+    print(f"✅ DONE")
+    print(f"   Steps:    {step:,}")
+    print(f"   Tokens:   {tokens_seen/1e6:.2f}M")
+    print(f"   Time:     {(time.time()-t_start)/3600:.2f}h")
+    print(f"   Loss:     {m['loss']:.4f}")
+    print(f"   PPL:      {m['ppl']:.1f}")
+    print(f"{'═'*55}")
 
-    print(f"\n📝 FINAL GENERATIONS")
-    print(f"{'─'*60}")
-    for p in prompts:
-        s = generate_sample(model, tokenizer, p, max_tokens=150)
-        print(f"\n> {p}")
-        print(f"  {s}")
-    print(f"{'─'*60}")
-
-    info = {
-        'model': 'FlashLM v5 Thunderbolt',
-        'params': model._total_params,
-        'ternary_params': model._ternary_params,
-        'steps': step,
-        'tokens_seen': tokens_seen,
-        'epochs': tokens_seen / n_train,
-        'final_loss': m['loss'],
-        'final_bpc': m['bpc'],
-        'final_ppl': m['ppl'],
-        'best_val_loss': best_val,
-        'training_hours': (time.time() - t_start) / 3600,
-        'config': C,
-    }
-    json.dump(info, open(out_dir / 'training_info.json', 'w'), indent=2)
-    print(f"\n📄 Saved to {out_dir / 'training_info.json'}")
-
-
-def generate_cli():
-    C = CONFIG
-    data_dir = Path(C['data_dir'])
-    out_dir = Path(C['out_dir'])
-    from tokenizers import Tokenizer
-    tokenizer = Tokenizer.from_file(str(data_dir / 'tokenizer.json'))
-    model = ThunderboltLM(
-        vocab=C['vocab'], d_model=C['d_model'], n_heads=C['n_heads'],
-        d_head=C['d_head'], n_layers=C['n_layers'], d_ffn=C['d_ffn'],
-    )
-    for name in ['best.pt', 'final.pt', 'latest.pt']:
-        path = out_dir / name
-        if path.exists():
-            print(f"📂 Loading {path}...")
-            sd = torch.load(path, map_location='cpu', weights_only=True)
-            if 'model' in sd:
-                sd = sd['model']
-            sd = {k.replace('_orig_mod.', ''): v for k, v in sd.items()}
-            model.load_state_dict(sd)
-            break
-    else:
-        print("❌ No checkpoint found. Train first!")
-        return
+    # Final generations
     model.eval()
-    print(f"\n{'═'*60}")
-    print(f"🎭 FlashLM v5 Interactive Generation")
-    print(f"   Type a prompt and press Enter. 'quit' to exit.")
-    print(f"{'═'*60}\n")
-    while True:
-        try:
-            prompt = input("You> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            break
-        if not prompt or prompt.lower() in ('quit', 'exit', 'q'):
-            break
-        ids = tokenizer.encode(prompt).ids
-        x = torch.tensor([ids], dtype=torch.long)
-        with torch.no_grad():
-            out = model.generate(x, max_new_tokens=200, temperature=0.8, top_k=50)
-        print(f"\n📖 {tokenizer.decode(out[0].tolist())}\n")
+    for p in prompts:
+        ids = tokenizer.encode(p).ids
+        out = model.generate(torch.tensor([ids], dtype=torch.long), max_new_tokens=60)
+        print(f"\n> {p}\n  {tokenizer.decode(out[0].tolist())}")
 
 
 if __name__ == '__main__':
-    os.environ.setdefault('OMP_NUM_THREADS', '8')
-    os.environ.setdefault('MKL_NUM_THREADS', '8')
-    os.environ.setdefault('TORCH_NUM_THREADS', '8')
-    os.environ.setdefault('MKL_ENABLE_INSTRUCTIONS', 'AVX512')
-    if len(sys.argv) > 1 and sys.argv[1] == 'generate':
-        generate_cli()
-    else:
-        train()
+    train()
