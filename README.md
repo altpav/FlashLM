@@ -37,7 +37,7 @@ The man took the little girl's hand, so he took her to a safe place. The girl wa
 The duck was so happy to have the lime. The bird and the bird shared the pear a big hug. They both felt proud of themselves for helping the bird. From that da
 ```
 
-### Earlier
+### Internal monologue
 
 - Per-layer scaling: Each layer has its own alpha (mean absolute value) for dynamic range.
 - Linear scaling with sequence length instead of quadratic.
