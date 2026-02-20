@@ -278,6 +278,7 @@ class IgnitionMoE(nn.Module):
 
     def forward(self, x):
         B, T, D = x.shape
+        input_dtype = x.dtype  # Store original dtype (bfloat16 from autocast)
         h = self.norm(x)
 
         # Shared expert (always computed)
@@ -292,21 +293,21 @@ class IgnitionMoE(nn.Module):
         topk_probs = topk_probs.squeeze(-1)  # (B, T)
         topk_idx = topk_idx.squeeze(-1)      # (B, T)
 
-        # Compute routed output - explicitly match dtype to avoid bfloat16/float32 mismatch
-        routed_out = torch.zeros(B, T, D, dtype=h.dtype, device=h.device)
+        # Compute routed output - use input dtype (bfloat16) to match expert output
+        routed_out = torch.zeros(B, T, D, dtype=input_dtype, device=x.device)
 
         for e in range(self.n_experts):
             # Find tokens routed to this expert
             mask = (topk_idx == e)
             if mask.any():
-                expert_in = h[mask]
+                expert_in = h[mask].to(input_dtype)  # Ensure input matches output dtype
                 expert_out = self.experts[e](expert_in)
                 # Ensure dtypes match before assignment
-                probs = topk_probs[mask].unsqueeze(-1).to(expert_out.dtype)
+                probs = topk_probs[mask].unsqueeze(-1).to(input_dtype)
                 routed_out[mask] = expert_out * probs
 
-        # Combine: shared + routed
-        return shared_out + routed_out
+        # Combine: shared + routed (ensure shared_out matches dtype)
+        return shared_out.to(input_dtype) + routed_out
 
 
 # ============================================================================
