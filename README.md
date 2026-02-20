@@ -1,11 +1,14 @@
-I came across this interesting idea and wanted to try it and conduct my own experiments and improvements on top of it.
+I came across this interesting idea (earlier discussed on reddit) and wanted to try it and conduct my own experiments and/or improvements on top of it.
 
 ### Notes:
 
+- I've added Blockwise Quantization - So instead of computing one alpha for the entire layer, we divide the flattened weight matrix into blocks of 256 elements and compute a separate alpha for each block. Each block thus has its own scaling factor adapted to its local weight distribution. A block with small-magnitude weights gets a small alpha, preserving precision in that region.
+- `RMSNorm` is defined before `BitLinear` to normalizes the input before the linear transformation. Pre-norm (old approach) normalizes at block level, but the data may drift before reaching `BitLinear`, so normalizes right before quantization make sure activations are in the correct scale for ternary weight operations (random discord anon).
+- Progressive `SEQ_LEN` training is still buggy but its was implemented i saw it somewhere that learning short range dependencies before long range is beneficial. The model first learns local patterns—word-level statistics, common bigrams and trigrams, basic syntactic structures—on the short sequences. Then, when we increase the sequence length, it can build on this foundation to learn longer-range dependencies.
+- trainv4.py still uses `GatedConvMixer` for now - people new to this, instead of maintaining and updating a recurrent state (in `GatedDeltaNet`), it applies a depthwise 1D convolution across the sequence. The input is projected to twice its dimension, split into a gate and a value, the value is convolved with a kernel of size 8, and the result is modulated by the sigmoid-activated gate before being projected back down.
 - My idea is to replace `GatedConvMixer` with `GatedDeltaNet`, which maintains a recurrent state matrix S that is updated at each timestep using the gated delta rule: the model computes what it expects to know about the current key (Sk), calculates the delta between the actual value and this expectation (v_t - Sk), then updates the state by decaying the old information (via gating) and adding the precise correction (via the delta rule).
 - The thing with `GatedDeltaNet` (and if im not wrong Kimi Attn) is it enables longer sequences, 1024/2048/etc, and maintains O(N) complexity! But it would be slower due to the sequential loop overhead.
 - I would also like to do some improvements to the current arch created by the OP before experimenting with `GatedDeltaNet` - may be dynamic bs, and based on bitnet b1.58 per block sclaing instead of per layer, high lr for embeddings and lower for deep layers (works for tiny model ?).
-- I've added Blockwise Quantization (now computes per block scaling factors instead of per layer and each block of 256 weights gets its own alpha (mean absolute value), `RMSNorm` is defined before `BitLinear` (will update repo soon w/ results). Pre-norm (old approach) normalizes at block level, but the data may drift before reaching `BitLinear`, so normalizes right before quantization make sure activations are in the correct scale for ternary weight operations (random discord anon).
 
 ### Training run before adding blockwise quantisation:
 ```
