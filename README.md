@@ -1,12 +1,43 @@
-I came across this interesting idea (earlier discussed on reddit) and wanted to try it and conduct my own experiments and/or improvements on top of it.
+I came across this interesting idea (discussed on reddit) and wanted to try it and conduct my own experiments and/or improvements on top of it.
 
-### Notes:
+Current High Level Structure (as per [trainv4_gdn.py](https://github.com/altpav/FlashLM/blob/main/trainv4_gdn.py)):
+```
+Input Tokens
+    ↓
+Embedding (vocab_size=10000, dim)
+    ↓
+[ImliBlock × N_BLOCKS]
+    ├─ RMSNorm
+    ├─ GatedDeltaNet
+    │   ├─ Q,K,V Projections: BitLinear(dim, key_dim/value_dim)
+    │   ├─ ShortConvolution (depthwise, causal, kernel=4) on Q,K,V
+    │   ├─ SiLU activation on Q,K,V
+    │   ├─ L2 Normalization on Q,K
+    │   ├─ Gate Projections: gk_proj, beta_proj (BitLinear → sigmoid/logsigmoid)
+    │   ├─ Recurrent Delta Rule Update (O(N) linear attention)
+    │   │   └─ S_t = exp(gk) * S_{t-1} + beta * outer(k, v - S@k)
+    │   ├─ Output Gate: g_proj (BitLinear → sigmoid)
+    │   └─ o_proj: BitLinear(value_dim, dim)
+    ├─ RMSNorm
+    └─ TernaryGLU
+        ├─ W_gate: BitLinear(dim, hidden) → SiLU
+        ├─ W_up: BitLinear(dim, hidden)
+        └─ W_down: BitLinear(hidden, dim)
+    ↓
+RMSNorm
+    ↓
+Linear Head (tied)
+    ↓
+Logits
+```
+
+### Step by Step Notes:
 
 - I've added Blockwise Quantization - So instead of computing one alpha for the entire layer, we divide the flattened weight matrix into blocks of 256 elements and compute a separate alpha for each block. Each block thus has its own scaling factor adapted to its local weight distribution. A block with small-magnitude weights gets a small alpha, preserving precision in that region.
 - `RMSNorm` is defined before `BitLinear` to normalizes the input before the linear transformation. Pre-norm (old approach) normalizes at block level, but the data may drift before reaching `BitLinear`, so normalizes right before quantization make sure activations are in the correct scale for ternary weight operations (random discord anon).
 - Progressive `SEQ_LEN` training is still buggy but its was implemented i saw it somewhere that learning short range dependencies before long range is beneficial. The model first learns local patterns, word-level statistics, common bigrams and trigrams, etc. Then, when we increase the sequence length, it can build on this foundation to learn longer-range dependencies.
 - trainv4.py still uses `GatedConvMixer` for now - people new to this, instead of maintaining and updating a recurrent state (in `GatedDeltaNet`), it applies a depthwise 1D convolution across the sequence. The input is projected to twice its dimension, split into a gate and a value, the value is convolved with a kernel of size 8, and the result is modulated by the sigmoid-activated gate before being projected back down.
-- Evals are just 💀 for current run. Previous run (shown below) was better without per block alpha amd rmsnorm before linear. Maybe, i'll remove norm from BitLinear, keep blockwise quantization only.
+- Evals are just 💀 for current run. Previous run was better without per block alpha amd rmsnorm before linear. Maybe, i'll remove norm from BitLinear, keep blockwise quantization only.
 - Next, my idea is to replace `GatedConvMixer` with `GatedDeltaNet`, which maintains a recurrent state matrix S that is updated at each timestep using the gated delta rule: the model computes what it expects to know about the current key (Sk), calculates the delta between the actual value and this expectation (v_t - Sk), then updates the state by decaying the old information (via gating) and adding the precise correction (via the delta rule).
 - The thing with `GatedDeltaNet` (and if im not wrong Kimi Attn) is it enables longer sequences, 1024/2048/etc, and maintains O(N) complexity! But it would be slower due to the sequential loop overhead.
 - Added `GatedDeltaNet` - it's naive, but combining GatedDeltaNet with ternary quantization is interesting. The implementation doesn't parallelize across sequence length, whereas in nvlabs repo we can see they've used chunkwise parallel algo. For output norm nvlabs uses FusedRMSNormSwishGate, and mine applies output gate via g_proj but no norm.
@@ -27,7 +58,7 @@ Total tokens trained: 40.4M
 Best validation loss: 2.003
 ```
 
-### Eval
+### Eval (w/ GatedDeltaNet)
 <img width="900" height="480" alt="screenshot-2026-02-21_11-45-08" src="https://github.com/user-attachments/assets/0e941944-0eee-4499-b2b1-8ae3d83b4cdb" />
 
 
