@@ -23,20 +23,22 @@ Blocks = 6
 Sequence length: 256
 Vocab size: 10k
 Weight tying
-Total tokens trained: 271.9M
-Best validation loss: 2.304
-
-Eval:
-BPC = 1.2941 | PPL = 53.96
+Total tokens trained: 40.4M
+Best validation loss: 2.003
 ```
+
+### Eval
+<img width="900" height="480" alt="screenshot-2026-02-21_11-45-08" src="https://github.com/user-attachments/assets/0e941944-0eee-4499-b2b1-8ae3d83b4cdb" />
+
+
 
 ### Sample:
 ```
 The little girl was very sad. She tried to go away but the cop said no.
 
-The man took the little girl's hand, so he took her to a safe place. The girl was safe, and she thanked the farmer for warning her. Then she walked away to a big tree.
+Once upon a time, there was a little girl named Lily. She loved to play outside in her backyard. One day, she found a shiny toy, and accidentally knocked it down. It was very expensive and had a loud noise.
 
-The duck was so happy to have the lime. The bird and the bird shared the pear a big hug. They both felt proud of themselves for helping the bird. From that da
+Lily felt sad and upset. She wanted to go back to her mom. She wanted to keep going. She was scared and her mom told her that she had to go to the hospital.
 ```
 
 ### Internal monologue
