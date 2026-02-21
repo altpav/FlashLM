@@ -1,7 +1,8 @@
 """
 Credit to @changcheng967 for the original idea and this is an experiment inspired by it.
 
-Added Gated Delta Network -linear attention w/ gating and delta rule.
+Added Gated Delta Network -linear attention w/ gating and delta rule. 
+(Naive Implementation - will improve a few things and update soon)
 """
 
 import os
